@@ -18,53 +18,104 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@0634a2670c59f64b4a01f0f96f84700a4088b9f0 # v2.12.0
         with:
-          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+          egress-policy: audit # Remember to review and potentially change to 'block'
 
       - name: Checkout Code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        # Fetch depth 2 is needed to diff the HEAD commit against its parent (HEAD~1)
+        # Fetch depth 2 is needed to diff/list files for the HEAD commit against its parent (HEAD~1)
         with:
           fetch-depth: 2
 
+      - name: Check for Parent Commit
+        id: check_parent
+        run: |
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            echo "Parent commit (HEAD~1) found."
+            echo "parent_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Parent commit (HEAD~1) not found. Cannot get diff or changed files for this commit (likely initial commit or shallow history)."
+            echo "parent_exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Get Git Diff for Last Commit
         id: git_diff
+        # Only run if parent commit exists
+        if: steps.check_parent.outputs.parent_exists == 'true'
         run: |
-          # Check if HEAD~1 exists (i.e., not the very first commit in the repo)
-          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-            echo "Getting diff between HEAD and HEAD~1..."
-            # Fetch the diff, handle potential errors
-            GIT_DIFF=$(git diff HEAD~1 HEAD || echo "ERROR: git diff failed")
+          echo "Getting diff between HEAD and HEAD~1..."
+          GIT_DIFF=$(git diff HEAD~1 HEAD || echo "ERROR: git diff failed")
 
-            if [[ "$GIT_DIFF" == "ERROR: git diff failed" ]]; then
-              echo "::error::Failed to get git diff."
-              echo "diff_exists=false" >> $GITHUB_OUTPUT
-              exit 1
-            elif [ -z "$GIT_DIFF" ]; then
-              echo "No changes detected between HEAD and HEAD~1 (possibly an empty commit or merge?). Skipping API call."
-              echo "diff_exists=false" >> $GITHUB_OUTPUT
-            else
-              echo "Diff captured successfully (${#GIT_DIFF} bytes)."
-              # Store the diff in an environment variable for the next step
-              # Using environment variable is better for multiline strings
-              echo "GIT_DIFF_CONTENT<<EOF" >> $GITHUB_ENV
-              echo "$GIT_DIFF" >> $GITHUB_ENV
-              echo "EOF" >> $GITHUB_ENV
-              echo "diff_exists=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "::warning::Cannot get diff for the initial commit or history is too shallow. Skipping API call."
+          if [[ "$GIT_DIFF" == "ERROR: git diff failed" ]]; then
+            echo "::error::Failed to get git diff."
+            # Set output to false, but don't exit yet, let follow-up steps handle based on output
             echo "diff_exists=false" >> $GITHUB_OUTPUT
+          elif [ -z "$GIT_DIFF" ]; then
+            echo "No changes detected between HEAD and HEAD~1. Setting diff_exists=false."
+            echo "diff_exists=false" >> $GITHUB_OUTPUT
+            # Set empty content for safety, though it won't be used if diff_exists is false
+            echo "GIT_DIFF_CONTENT=" >> $GITHUB_ENV
+          else
+            echo "Diff captured successfully (${#GIT_DIFF} bytes)."
+            echo "GIT_DIFF_CONTENT<<EOF" >> $GITHUB_ENV
+            echo "$GIT_DIFF" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+            echo "diff_exists=true" >> $GITHUB_OUTPUT
           fi
+        shell: bash # Explicitly use bash for [[ ]]
+
+      - name: Get Changed Files List
+        id: changed_files
+        # Only run if parent commit exists
+        if: steps.check_parent.outputs.parent_exists == 'true'
+        run: |
+          echo "Getting list of changed files between HEAD and HEAD~1..."
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "ERROR: git diff --name-only failed")
+
+          if [[ "$CHANGED_FILES" == "ERROR: git diff --name-only failed" ]]; then
+             echo "::error::Failed to get changed files list."
+             echo "files_list_exists=false" >> $GITHUB_OUTPUT
+             # Set empty content for safety
+             echo "CHANGED_FILES_CONTENT=" >> $GITHUB_ENV
+          elif [ -z "$CHANGED_FILES" ]; then
+             echo "No changed files detected. Setting files_list_exists=false."
+             echo "files_list_exists=false" >> $GITHUB_OUTPUT
+             echo "CHANGED_FILES_CONTENT=" >> $GITHUB_ENV
+          else
+             echo "Changed files list captured."
+             echo "CHANGED_FILES_CONTENT<<EOF" >> $GITHUB_ENV
+             echo "$CHANGED_FILES" >> $GITHUB_ENV
+             echo "EOF" >> $GITHUB_ENV
+             echo "files_list_exists=true" >> $GITHUB_OUTPUT
+          fi
+        shell: bash # Explicitly use bash for [[ ]]
 
       - name: Prepare JSON Payload
         id: prepare_json
-        # Only run if a diff was successfully captured
+        # Only proceed if the diff was successfully captured (most critical piece)
+        # We can pass empty values for other fields if they failed or were empty
         if: steps.git_diff.outputs.diff_exists == 'true'
         run: |
           echo "Preparing JSON payload..."
-          # Use jq to safely escape the diff content and create the JSON payload
-          # The GIT_DIFF_CONTENT env var is automatically available here
-          JSON_PAYLOAD=$(jq -n --arg diff "$GIT_DIFF_CONTENT" '{diff_text: $diff}')
+
+          # Prepare changed files list as a JSON array string (will be empty array [] if CHANGED_FILES_CONTENT is empty)
+          # Reads the CHANGED_FILES_CONTENT env var (multiline), pipes to jq to escape each line (-R)
+          # then pipes to jq again to collect lines into a JSON array (-s)
+          CHANGED_FILES_JSON_ARRAY=$(echo "$CHANGED_FILES_CONTENT" | jq -R . | jq -s .)
+
+          # Safely get author name and commit message (handle potential issues, though unlikely)
+          AUTHOR_NAME=$(echo "${{ github.event.head_commit.author.name }}" | tr -d '\0')
+          EXISTING_MESSAGE=$(echo "${{ github.event.head_commit.message }}" | tr -d '\0')
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | tr -d '\0')
+
+          # Use jq to safely escape content and create the JSON payload
+          # Pass captured context as arguments to jq
+          JSON_PAYLOAD=$(jq -n \
+            --arg diff "$GIT_DIFF_CONTENT" \
+            --arg branch "$BRANCH_NAME" \
+            --argjson files "$CHANGED_FILES_JSON_ARRAY" \
+            --arg author "$AUTHOR_NAME" \
+            --arg message "$EXISTING_MESSAGE" \
+            '{ "diff_text": $diff, "branch_name": $branch, "changed_files": $files, "author_name": $author, "existing_message": $message }')
 
           # Check if jq failed
           if [ $? -ne 0 ]; then
@@ -73,13 +124,17 @@ jobs:
              exit 1
           fi
 
+          echo "JSON payload prepared."
           # Make the JSON payload available to subsequent steps via environment variable
           echo "JSON_PAYLOAD_CONTENT<<EOF" >> $GITHUB_ENV
           echo "$JSON_PAYLOAD" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "json_prepared=true" >> $GITHUB_OUTPUT
-          echo "JSON payload prepared."
-        # Ensure jq is available (it usually is on ubuntu-latest)
+
+        # Make environment variables from previous steps available
+        env:
+          GIT_DIFF_CONTENT: ${{ env.GIT_DIFF_CONTENT }}
+          CHANGED_FILES_CONTENT: ${{ env.CHANGED_FILES_CONTENT }}
         shell: bash
 
       - name: Call Commit Message API
@@ -90,9 +145,6 @@ jobs:
           echo "Calling API endpoint: ${{ secrets.COMMIT_API_URL }}/generate_commit_message"
 
           # Use curl to send the request
-          # --fail: exit non-zero on server errors (4xx, 5xx)
-          # -s: silent mode (don't show progress meter)
-          # -S: show errors if silent mode is enabled
           API_RESPONSE=$(curl --fail -sS -X POST \
             -H "Authorization: Bearer ${{ secrets.COMMIT_API_TOKEN }}" \
             -H "Content-Type: application/json" \
@@ -103,7 +155,6 @@ jobs:
           CURL_EXIT_CODE=$?
           if [ $CURL_EXIT_CODE -ne 0 ]; then
             echo "::error::API call failed with exit code $CURL_EXIT_CODE."
-            # Try to print response even on failure, might contain error details from API
             echo "Raw API response (if any): $API_RESPONSE"
             exit $CURL_EXIT_CODE
           fi
@@ -122,28 +173,20 @@ jobs:
         if: steps.call_api.outcome == 'success'
         run: |
           echo "Extracting commit message from API response..."
-          # Use jq to parse the JSON response and extract the commit message
-          # -r flag outputs raw string without quotes
           GENERATED_MESSAGE=$(echo "$API_RESPONSE_CONTENT" | jq -r '.commit_message')
 
           # Check if jq failed or message is empty/null
           if [ $? -ne 0 ] || [ -z "$GENERATED_MESSAGE" ] || [ "$GENERATED_MESSAGE" == "null" ]; then
-            echo "::warning::Could not extract 'commit_message' from API response."
+            echo "::warning::Could not extract 'commit_message' from API response or message was empty."
             echo "Raw API Response: $API_RESPONSE_CONTENT"
-            # Optional: Consider failing the job if message extraction fails
-            # exit 1
           else
             echo "Successfully extracted message."
             echo "------------------------------------"
             echo "Suggested Commit Message:"
             echo "------------------------------------"
-            # Output the message in a way that preserves formatting
+            # Output the message preserving formatting
             echo "$GENERATED_MESSAGE"
             echo "------------------------------------"
-            # If you wanted to use this message later (e.g., amend commit), store it:
-            # echo "generated_message<<EOF" >> $GITHUB_OUTPUT
-            # echo "$GENERATED_MESSAGE" >> $GITHUB_OUTPUT
-            # echo "EOF" >> $GITHUB_OUTPUT
           fi
         # Make API response env var available
         env:
