@@ -1,0 +1,152 @@
+name: Generate Commit Message Suggestion
+
+on:
+  push:
+    branches:
+      - '*'
+    branches-ignore:
+      - 'main'
+      - 'master'
+
+permissions:
+  contents: read
+
+jobs:
+  suggest_commit_message:
+    runs-on: ubuntu-latest
+    if: github.event.head_commit != null
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@0634a2670c59f64b4a01f0f96f84700a4088b9f0 # v2.12.0
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        # Fetch depth 2 is needed to diff the HEAD commit against its parent (HEAD~1)
+        with:
+          fetch-depth: 2
+
+      - name: Get Git Diff for Last Commit
+        id: git_diff
+        run: |
+          # Check if HEAD~1 exists (i.e., not the very first commit in the repo)
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            echo "Getting diff between HEAD and HEAD~1..."
+            # Fetch the diff, handle potential errors
+            GIT_DIFF=$(git diff HEAD~1 HEAD || echo "ERROR: git diff failed")
+
+            if [[ "$GIT_DIFF" == "ERROR: git diff failed" ]]; then
+              echo "::error::Failed to get git diff."
+              echo "diff_exists=false" >> $GITHUB_OUTPUT
+              exit 1
+            elif [ -z "$GIT_DIFF" ]; then
+              echo "No changes detected between HEAD and HEAD~1 (possibly an empty commit or merge?). Skipping API call."
+              echo "diff_exists=false" >> $GITHUB_OUTPUT
+            else
+              echo "Diff captured successfully (${#GIT_DIFF} bytes)."
+              # Store the diff in an environment variable for the next step
+              # Using environment variable is better for multiline strings
+              echo "GIT_DIFF_CONTENT<<EOF" >> $GITHUB_ENV
+              echo "$GIT_DIFF" >> $GITHUB_ENV
+              echo "EOF" >> $GITHUB_ENV
+              echo "diff_exists=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::warning::Cannot get diff for the initial commit or history is too shallow. Skipping API call."
+            echo "diff_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare JSON Payload
+        id: prepare_json
+        # Only run if a diff was successfully captured
+        if: steps.git_diff.outputs.diff_exists == 'true'
+        run: |
+          echo "Preparing JSON payload..."
+          # Use jq to safely escape the diff content and create the JSON payload
+          # The GIT_DIFF_CONTENT env var is automatically available here
+          JSON_PAYLOAD=$(jq -n --arg diff "$GIT_DIFF_CONTENT" '{diff_text: $diff}')
+
+          # Check if jq failed
+          if [ $? -ne 0 ]; then
+             echo "::error::Failed to create JSON payload using jq."
+             echo "json_prepared=false" >> $GITHUB_OUTPUT
+             exit 1
+          fi
+
+          # Make the JSON payload available to subsequent steps via environment variable
+          echo "JSON_PAYLOAD_CONTENT<<EOF" >> $GITHUB_ENV
+          echo "$JSON_PAYLOAD" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "json_prepared=true" >> $GITHUB_OUTPUT
+          echo "JSON payload prepared."
+        # Ensure jq is available (it usually is on ubuntu-latest)
+        shell: bash
+
+      - name: Call Commit Message API
+        id: call_api
+        # Only run if JSON payload was prepared successfully
+        if: steps.prepare_json.outputs.json_prepared == 'true'
+        run: |
+          echo "Calling API endpoint: ${{ secrets.COMMIT_API_URL }}/generate_commit_message"
+
+          # Use curl to send the request
+          # --fail: exit non-zero on server errors (4xx, 5xx)
+          # -s: silent mode (don't show progress meter)
+          # -S: show errors if silent mode is enabled
+          API_RESPONSE=$(curl --fail -sS -X POST \
+            -H "Authorization: Bearer ${{ secrets.COMMIT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD_CONTENT" \
+            "${{ secrets.COMMIT_API_URL }}/generate_commit_message")
+
+          # Check curl exit code for errors
+          CURL_EXIT_CODE=$?
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+            echo "::error::API call failed with exit code $CURL_EXIT_CODE."
+            # Try to print response even on failure, might contain error details from API
+            echo "Raw API response (if any): $API_RESPONSE"
+            exit $CURL_EXIT_CODE
+          fi
+
+          echo "API call successful."
+          # Store the successful API response in an environment variable
+          echo "API_RESPONSE_CONTENT<<EOF" >> $GITHUB_ENV
+          echo "$API_RESPONSE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        # Make JSON payload env var available to the script
+        env:
+          JSON_PAYLOAD_CONTENT: ${{ env.JSON_PAYLOAD_CONTENT }}
+
+      - name: Extract and Display Commit Message
+        # Only run if the API call step succeeded
+        if: steps.call_api.outcome == 'success'
+        run: |
+          echo "Extracting commit message from API response..."
+          # Use jq to parse the JSON response and extract the commit message
+          # -r flag outputs raw string without quotes
+          GENERATED_MESSAGE=$(echo "$API_RESPONSE_CONTENT" | jq -r '.commit_message')
+
+          # Check if jq failed or message is empty/null
+          if [ $? -ne 0 ] || [ -z "$GENERATED_MESSAGE" ] || [ "$GENERATED_MESSAGE" == "null" ]; then
+            echo "::warning::Could not extract 'commit_message' from API response."
+            echo "Raw API Response: $API_RESPONSE_CONTENT"
+            # Optional: Consider failing the job if message extraction fails
+            # exit 1
+          else
+            echo "Successfully extracted message."
+            echo "------------------------------------"
+            echo "Suggested Commit Message:"
+            echo "------------------------------------"
+            # Output the message in a way that preserves formatting
+            echo "$GENERATED_MESSAGE"
+            echo "------------------------------------"
+            # If you wanted to use this message later (e.g., amend commit), store it:
+            # echo "generated_message<<EOF" >> $GITHUB_OUTPUT
+            # echo "$GENERATED_MESSAGE" >> $GITHUB_OUTPUT
+            # echo "EOF" >> $GITHUB_OUTPUT
+          fi
+        # Make API response env var available
+        env:
+          API_RESPONSE_CONTENT: ${{ env.API_RESPONSE_CONTENT }}
