@@ -1,90 +1,133 @@
 import os
 import logging
-from openai import AsyncOpenAI # Use AsyncOpenAI for FastAPI
+import re
+from typing import List
+from openai import AsyncOpenAI
 
 # --- Setup Logging ---
-# It's good practice to use logging instead of print in libraries/modules
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-# Get base URL and port from environment variables
-# Default to localhost:11434, common for host network or non-Docker setups.
-# For Docker Desktop (Mac/Win), you might need 'http://host.docker.internal' as LLM_BASE_URL
-# or run the FastAPI container with --network="host".
 llm_host = os.getenv("LLM_BASE_URL", "http://localhost")
 llm_port = os.getenv("LLM_BASE_PORT", "11434")
-
-# Construct the full base URL for the OpenAI-compatible endpoint
-# Ensure no trailing slash in llm_host before adding port and path
-ollama_api_base_url = f"{llm_host.rstrip('/')}:{llm_port}/v1"
-
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3") # Default model
+llm_api_base_url = f"{llm_host.rstrip('/')}:{llm_port}/v1"
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3")
 
 SYSTEM_PROMPT = """
-You are an expert programmer reviewing code changes.
-Analyze the following git diff and generate a concise, informative, and semantic commit message.
-Follow the Conventional Commits specification (e.g., 'feat: add user login', 'fix: resolve calculation error', 'chore: update dependencies', 'docs: explain API endpoint').
-The message should be a single line, ideally under 72 characters. Do not include backticks or the word 'commit message' in the output.
-Focus on *what* the change achieves and *why*, not just *how*.
+You are an expert programmer tasked with writing a git commit message.
+Analyze the provided context and git diff to generate ONLY the commit message subject line.
+Follow the Conventional Commits specification (e.g., 'feat: ...', 'fix: ...', 'chore: ...', 'docs: ...').
+The subject line should be concise, imperative (e.g., 'Add feature', not 'Added feature'), and ideally under 72 characters.
+Do not include backticks, markdown formatting, or the phrase 'commit message:' in your output. Just provide the raw subject line.
+Focus on *what* the change achieves and *why*.
 """
 
-logger.info(f"Configuring Ollama client:")
-logger.info(f"  API Base URL: {ollama_api_base_url}")
+logger.info(f"Configuring LLM client:")
+logger.info(f"  API Base URL: {llm_api_base_url}")
 logger.info(f"  Model: {MODEL_NAME}")
 
 # --- Initialize Async OpenAI Client ---
-# Configure the client to connect to the constructed Ollama endpoint
 try:
     client = AsyncOpenAI(
-        base_url=ollama_api_base_url,
-        api_key="ollama", # required by the library, but Ollama server doesn't check it
-        timeout=30.0,     # Set a reasonable timeout (adjust as needed)
+        base_url=llm_api_base_url,
+        api_key="ollama", # required by library, not checked by Ollama
+        timeout=45.0,
     )
 except Exception as e:
     logger.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
-    # Depending on requirements, you might want to raise a critical error here
-    # or handle it gracefully in the calling code (main.py)
-    client = None # Ensure client is None if initialization fails
+    client = None
 
-# --- Core Function ---
-async def generate_commit_message_from_diff(diff_text: str) -> str:
+async def generate_commit_message_with_context(
+    diff_text: str,
+    branch_name: str,
+    changed_files: List[str],
+    author_name: str,
+    existing_message: str
+) -> str:
     """
-    Calls the Ollama API to generate a commit message based on the provided diff.
+    Calls the Ollama API to generate a commit message using the diff and context.
     """
     if not client:
         logger.error("LLM client is not initialized. Cannot generate commit message.")
-        raise ConnectionError("LLM client failed to initialize.") # Or return an error message
+        raise ConnectionError("LLM client failed to initialize.")
 
-    user_prompt = f"Generate a commit message for the following diff:\n```diff\n{diff_text}\n```"
+    prompt_lines = [
+        "Generate a Conventional Commit message subject line based on the following context and git diff."
+    ]
+
+    # Context Section
+    prompt_lines.append("\n# Context:")
+    prompt_lines.append(f"- Branch: {branch_name}")
+
+    # Attempt to extract a ticket ID (e.g., JIRA-123, TKT-456)
+    # This pattern looks for 1 or more uppercase letters, a hyphen, and 1 or more digits.
+    match = re.search(r'([A-Z]+-\d+)', branch_name, re.IGNORECASE)
+    if match:
+        ticket_id = match.group(1).upper()
+        prompt_lines.append(f"- Potential Ticket ID from branch: {ticket_id} (If relevant, the commit body should reference this, e.g., 'Refs {ticket_id}', but DO NOT include it in the subject line itself unless essential).")
+
+    prompt_lines.append(f"- Author: {author_name}")
+
+    if changed_files:
+        prompt_lines.append("- Changed Files:")
+        limit = 10
+        for f in changed_files[:limit]:
+            prompt_lines.append(f"  - {f}")
+        if len(changed_files) > limit:
+            prompt_lines.append(f"  - ... ({len(changed_files) - limit} more)")
+
+    if existing_message and not existing_message.isspace():
+        if "Merge pull request #" in existing_message or "Merge branch " in existing_message:
+             prompt_lines.append(f"- Note: The existing message ('{existing_message.splitlines()[0]}...') seems like a default merge message. Generate a new message based *only* on the diff and other context.")
+        else:
+            prompt_lines.append(f"- Existing Message Draft: '{existing_message.splitlines()[0]}' (Analyze the diff and context. Either refine this draft or generate a completely new subject line if this draft is inadequate or inaccurate.)")
+
+    prompt_lines.append("\n# Git Diff:")
+    prompt_lines.append("```diff")
+    max_diff_len = 15000
+    truncated_diff = (diff_text[:max_diff_len] + '\n... [TRUNCATED]') if len(diff_text) > max_diff_len else diff_text
+    prompt_lines.append(truncated_diff)
+    prompt_lines.append("```")
+    prompt_lines.append("\nGenerate the single-line commit message subject NOW:")
+
+    user_prompt = "\n".join(prompt_lines)
 
     try:
-        logger.debug(f"Sending request to Ollama model '{MODEL_NAME}' at {ollama_api_base_url}")
+        logger.debug(f"Sending request to Ollama model '{MODEL_NAME}'. User prompt length: {len(user_prompt)}")
+
         response = await client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.5, # Adjust for creativity vs predictability
-            max_tokens=75,   # Increased slightly for potentially longer conventional commit types like feat(...)
+            temperature=0.4,
+            max_tokens=100,
             stream=False,
+            # stop=["\n"] # Optional: Force stop after the first line if model tends to be verbose
         )
         message = response.choices[0].message.content.strip()
-        logger.debug(f"Received response from Ollama: '{message}'")
+        logger.debug(f"Raw response from Ollama: '{message}'")
 
-        # Basic post-processing
-        if message.startswith('"') and message.endswith('"'):
-            message = message[1:-1]
-        if message.startswith("'") and message.endswith("'"):
-            message = message[1:-1]
-        if message.startswith("```") and message.endswith("```"):
-            message = message.strip("`\n ")
+        # --- Post-processing ---
+        # Remove potential quotation marks or markdown code blocks
+        message = re.sub(r'^["\']', '', message)
+        message = re.sub(r'["\']$', '', message)
+        message = message.strip('` \n')
+        # Take only the first line if the model generated more
+        message = message.splitlines()[0] if message else ""
 
+
+        if not message:
+            logger.warning("Model '{MODEL_NAME}' returned an empty message.")
+            return "chore: Automatic generation failed"
+
+        logger.info(f"Generated commit message: '{message}'")
         return message
 
     except Exception as e:
         logger.error(
-            f"Error calling Ollama (model: {MODEL_NAME}, URL: {ollama_api_base_url}): {e}",
+            f"Error calling LLM (model: {MODEL_NAME}, URL: {llm_api_base_url}): {e}",
             exc_info=True
         )
-        raise ConnectionError(f"Failed to communicate with Ollama service at {ollama_api_base_url}") from e
+        raise ConnectionError(f"Failed to communicate with LLM service at {llm_api_base_url}") from e

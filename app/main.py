@@ -7,9 +7,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-
 from .models import DiffInput, CommitMessageOutput
-from .llm_client import generate_commit_message_from_diff, MODEL_NAME
+from .llm_client import generate_commit_message_with_context, MODEL_NAME
 
 API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 DEFAULT_RATE_LIMIT = os.getenv("RATE_LIMIT", "10/minute")
@@ -54,16 +53,13 @@ limiter = Limiter(key_func=get_remote_address, default_limits=[DEFAULT_RATE_LIMI
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Git Commit Message Generator API",
-    description=f"Generates commit messages from git diffs using Ollama ({MODEL_NAME}).",
-    version="0.1.0",
+    description=f"Generates commit messages from git commit context using Ollama ({MODEL_NAME}).",
+    version="0.2.0", # Incremented version
 )
 
 # --- Apply Middleware & Exception Handlers ---
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-# Important: Middleware runs *before* dependencies.
-# If you want auth check *before* rate limiting (e.g., different limits per user),
-# you might integrate rate limiting within the endpoint/dependency itself.
 app.add_middleware(SlowAPIMiddleware)
 
 
@@ -79,29 +75,41 @@ async def read_root():
     dependencies=[Depends(verify_token)],
     tags=["Commit Generation"]
 )
-async def generate_commit_message_endpoint(diff_input: DiffInput):
+
+async def generate_commit_message_endpoint(commit_data: DiffInput):
     """
-    Receives git diff text and returns a generated commit message suggestion.
+    Receives git diff text and related context (branch, files, author, existing message)
+    and returns a generated commit message suggestion.
 
     Requires Bearer token authentication.
     Rate limited per client IP address.
     """
-    logger.info(f"Received request to generate commit message for diff of length: {len(diff_input.diff_text)}")
+    # Log received data (be mindful of logging sensitive diff content if necessary)
+    logger.info(f"Received request for commit message generation. Branch: '{commit_data.branch_name}', Author: '{commit_data.author_name}', Files changed: {len(commit_data.changed_files)}, Diff length: {len(commit_data.diff_text)}")
+    logger.debug(f"Changed Files: {commit_data.changed_files}")
+    logger.debug(f"Existing Message: {commit_data.existing_message}")
 
-    if not diff_input.diff_text or diff_input.diff_text.isspace():
+    if not commit_data.diff_text or commit_data.diff_text.isspace():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="diff_text cannot be empty."
         )
 
     try:
-        commit_message = await generate_commit_message_from_diff(diff_input.diff_text)
-        logger.info(f"Generated commit message: {commit_message}")
+        # Pass all the received data to the updated core logic function
+        commit_message = await generate_commit_message_with_context(
+            diff_text=commit_data.diff_text,
+            branch_name=commit_data.branch_name,
+            changed_files=commit_data.changed_files,
+            author_name=commit_data.author_name,
+            existing_message=commit_data.existing_message
+        )
+        logger.info(f"Generated commit message snippet: {commit_message[:100]}...") # Log snippet
         return CommitMessageOutput(commit_message=commit_message)
 
     except Exception as e:
         logger.error(f"Error during commit message generation: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to generate commit message due to an internal error: {e}"
+            detail=f"Failed to generate commit message due to an internal server error."
         )
