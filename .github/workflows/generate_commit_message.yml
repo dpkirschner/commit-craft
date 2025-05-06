@@ -2,8 +2,6 @@ name: Generate Commit Message Suggestion
 
 on:
   push:
-    branches:
-      - '*'
     branches-ignore:
       - 'main'
       - 'master'
