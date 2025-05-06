@@ -1,0 +1,30 @@
+services:
+  ollama:
+    build:
+      context: .
+      dockerfile: ollama.Dockerfile # custom version with curl
+    volumes:
+      - ollama:/root/.ollama
+      - ./entrypoint.sh:/entrypoint.sh
+    ports:
+      - "11434:11434"
+    entrypoint: /entrypoint.sh
+    # Optional environment variable for the model
+    # environment:
+    #   - OLLAMA_PULL_MODEL=codellama
+
+  craft:
+    build: .
+    depends_on:
+      - ollama
+    environment:
+      LLM_BASE_URL: http://ollama
+      LLM_BASE_PORT: 11434
+      API_SECRET_KEY: ${API_SECRET_KEY}
+      OLLAMA_MODEL: llama3
+      RATE_LIMIT: 30/minute
+    ports:
+      - "8000:8000"
+
+volumes:
+  ollama: {}

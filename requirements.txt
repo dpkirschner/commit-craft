@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx           # For making HTTP requests to Ollama
+pydantic
+python-dotenv   # For local .env loading
+openai          # To easily interact with the OpenAI-compatible endpoint
+slowapi
