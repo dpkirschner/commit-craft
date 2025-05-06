@@ -1,55 +1,60 @@
 import pytest
 import os
-from unittest.mock import patch, AsyncMock # Use AsyncMock for async functions
+from unittest.mock import patch, AsyncMock
 
-# Use httpx's AsyncClient for testing async FastAPI apps
-from httpx import AsyncClient
+# Use httpx's AsyncClient AND ASGIAppTransport for testing
+# Requires httpx version that supports ASGI transport (like 0.2x)
+from httpx import AsyncClient, ASGITransport # <-- Import ASGITransport
 
-# Import the FastAPI app instance from your main module
-# Adjust the import path based on your project structure
-# Assuming 'app' is a package in your project root
-from app.main import app
-from app.models import CommitMessageOutput # For asserting response structure
+# Import the FastAPI app instance and necessary components
+from app.main import app, API_SECRET_KEY, MODEL_NAME
+from app.models import CommitMessageOutput
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+# Import the specific handler for the assertion
+from slowapi import _rate_limit_exceeded_handler # <-- Import handler
 
 # --- Test Configuration ---
-# Use a fixed secret key for testing
 TEST_API_SECRET_KEY = "test_secret_key_123"
-# Use a known model name for testing consistency
 TEST_MODEL_NAME = "test_model"
 
-# Set environment variables BEFORE the app is imported by pytest fixtures
-# Note: Pytest fixtures load modules, so set env vars early
-# Alternatively, use pytest-dotenv or monkeypatch fixture in tests.
-os.environ["API_SECRET_KEY"] = TEST_API_SECRET_KEY
-os.environ["OLLAMA_MODEL"] = TEST_MODEL_NAME # Ensure llm_client sees this too if needed
+# --- Pytest Fixture Setup (using monkeypatch for env vars) ---
+
+@pytest.fixture(autouse=True)
+def setup_test_environment(monkeypatch):
+    """Sets environment variables for the test session."""
+    monkeypatch.setenv("API_SECRET_KEY", TEST_API_SECRET_KEY)
+    monkeypatch.setenv("OLLAMA_MODEL", TEST_MODEL_NAME)
+    monkeypatch.setattr("app.main.API_SECRET_KEY", TEST_API_SECRET_KEY)
+    monkeypatch.setattr("app.main.MODEL_NAME", TEST_MODEL_NAME)
 
 
 # --- Fixtures ---
 
-@pytest.fixture(scope="function") # Recreate client for each test function
+@pytest.fixture(scope="function")
 async def test_client():
-    """Creates an httpx AsyncClient for making requests to the app."""
-    # Use 'async with' for proper client startup/shutdown
-    async with AsyncClient(app=app, base_url="http://test") as client:
+    """Creates an httpx AsyncClient configured for the FastAPI app."""
+    # For httpx versions that support ASGI testing via transport (like 0.28.1):
+    # Use ASGITransport pointing to the FastAPI 'app' instance.
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
 
-@pytest.fixture(autouse=True) # Apply this mock automatically to all tests
+@pytest.fixture(autouse=True)
 def mock_llm():
     """Mocks the generate_commit_message_from_diff function."""
-    # Patch the function *where it's imported and used* in main.py
-    # Use AsyncMock because the original function is async
     with patch("app.main.generate_commit_message_from_diff", new_callable=AsyncMock) as mock_func:
-        yield mock_func # The test function will receive this mock object if needed
-
+        yield mock_func
 
 # --- Test Cases ---
+# Calls to test_client.get/post etc. are now async with httpx.AsyncClient
 
 @pytest.mark.asyncio
-async def test_read_root(test_client: AsyncClient):
+async def test_read_root(test_client: AsyncClient): # Type hint correct for httpx
     """Tests the health check endpoint."""
+    # Use await for httpx.AsyncClient calls
     response = await test_client.get("/")
     assert response.status_code == 200
-    # Check response body, accounting for model name from env var
     expected_data = {"status": "ok", "ollama_model": TEST_MODEL_NAME}
     assert response.json() == expected_data
 
@@ -57,12 +62,12 @@ async def test_read_root(test_client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_generate_commit_no_auth(test_client: AsyncClient):
-    """Tests the commit endpoint without any authentication."""
+    """Tests the commit endpoint without any authentication header."""
     response = await test_client.post("/generate_commit_message", json={"diff_text": "some diff"})
-    # Expect 403 Forbidden when HTTPBearer dependency fails without header
     assert response.status_code == 403
-    assert "Not authenticated" in response.json()["detail"] # Or check specific detail message
+    assert "Not authenticated" in response.json()["detail"]
 
+      
 @pytest.mark.asyncio
 async def test_generate_commit_wrong_scheme(test_client: AsyncClient):
     """Tests the commit endpoint with incorrect auth scheme."""
@@ -71,8 +76,9 @@ async def test_generate_commit_wrong_scheme(test_client: AsyncClient):
         json={"diff_text": "some diff"},
         headers={"Authorization": f"Basic {TEST_API_SECRET_KEY}"} # Wrong scheme
     )
-    assert response.status_code == 401 # Changed based on code logic
-    assert "Invalid authentication scheme" in response.json()["detail"]
+    # Expect 403 because HTTPBearer(auto_error=True) rejects non-Bearer schemes
+    assert response.status_code == 403
+    assert "Invalid authentication credentials" in response.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_generate_commit_wrong_token(test_client: AsyncClient):
@@ -84,6 +90,8 @@ async def test_generate_commit_wrong_token(test_client: AsyncClient):
     )
     assert response.status_code == 403
     assert "Invalid or expired token" in response.json()["detail"]
+    assert response.headers.get("www-authenticate") == "Bearer"
+
 
 # -- Commit Generation Logic Tests --
 
@@ -93,21 +101,17 @@ async def test_generate_commit_success(test_client: AsyncClient, mock_llm: Async
     mock_diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-hello\n+world"
     expected_message = "feat: update file.txt"
 
-    # Configure the mock to return a specific value when called
     mock_llm.return_value = expected_message
 
     response = await test_client.post(
         "/generate_commit_message",
         json={"diff_text": mock_diff},
-        headers={"Authorization": f"Bearer {TEST_API_SECRET_KEY}"} # Correct token
+        headers={"Authorization": f"Bearer {TEST_API_SECRET_KEY}"}
     )
 
     assert response.status_code == 200
-    # Validate response structure using the Pydantic model if desired
     response_data = CommitMessageOutput(**response.json())
     assert response_data.commit_message == expected_message
-
-    # Assert that the mocked LLM function was called correctly
     mock_llm.assert_awaited_once_with(mock_diff)
 
 @pytest.mark.asyncio
@@ -115,37 +119,34 @@ async def test_generate_commit_empty_diff(test_client: AsyncClient, mock_llm: As
     """Tests sending an empty diff string."""
     response = await test_client.post(
         "/generate_commit_message",
-        json={"diff_text": "  "}, # Empty or whitespace only
+        json={"diff_text": "  "},
         headers={"Authorization": f"Bearer {TEST_API_SECRET_KEY}"}
     )
-    assert response.status_code == 400 # Bad Request
+    assert response.status_code == 400
     assert "diff_text cannot be empty" in response.json()["detail"]
-    mock_llm.assert_not_awaited() # Ensure LLM func wasn't called
+    mock_llm.assert_not_awaited()
 
 @pytest.mark.asyncio
-async def test_generate_commit_missing_diff(test_client: AsyncClient, mock_llm: AsyncMock):
+async def test_generate_commit_missing_diff_field(test_client: AsyncClient, mock_llm: AsyncMock):
     """Tests sending invalid JSON (missing 'diff_text')."""
     response = await test_client.post(
         "/generate_commit_message",
-        json={"other_field": "value"}, # Missing 'diff_text'
+        json={"other_field": "value"},
         headers={"Authorization": f"Bearer {TEST_API_SECRET_KEY}"}
     )
-    # FastAPI handles Pydantic validation errors with 422
     assert response.status_code == 422
-    # Check for detail about missing field in the response body if needed
-    # assert "diff_text" in response.text
-    # assert "field required" in response.text
-    mock_llm.assert_not_awaited() # Ensure LLM func wasn't called
+    assert any("diff_text" in error["loc"] and "Field required" in error["msg"] for error in response.json()["detail"])
+    mock_llm.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_generate_commit_llm_error(test_client: AsyncClient, mock_llm: AsyncMock):
     """Tests the case where the LLM client raises an exception."""
     mock_diff = "valid diff"
-    error_message = "Ollama connection failed"
+    error_instance = ConnectionError("Ollama connection failed")
+    error_message = str(error_instance)
 
-    # Configure the mock to raise an exception when called
-    mock_llm.side_effect = ConnectionError(error_message)
+    mock_llm.side_effect = error_instance
 
     response = await test_client.post(
         "/generate_commit_message",
@@ -153,23 +154,26 @@ async def test_generate_commit_llm_error(test_client: AsyncClient, mock_llm: Asy
         headers={"Authorization": f"Bearer {TEST_API_SECRET_KEY}"}
     )
 
-    assert response.status_code == 503 # Service Unavailable
-    assert f"Failed to generate commit message due to an internal error: {error_message}" in response.json()["detail"]
-
-    # Assert that the mocked LLM function was called
+    assert response.status_code == 503
+    assert "Failed to generate commit message due to an internal error" in response.json()["detail"]
+    assert error_message in response.json()["detail"]
     mock_llm.assert_awaited_once_with(mock_diff)
 
 # --- Rate Limiting (Basic Check) ---
-# Fully testing rate limiting state across requests is complex in unit tests.
-# These tests primarily ensure that requests *pass* when the middleware is active
-# and authentication is correct. We rely on the success tests above for this.
-# We can also check if the middleware is registered, though less common.
 
 def test_rate_limit_middleware_registered():
-    """Checks if the SlowAPIMiddleware is present in the app's middleware stack."""
-    middleware_classes = [m.cls for m in app.middleware]
-    assert SlowAPIMiddleware in middleware_classes
+    """Checks if the SlowAPIMiddleware is present in the app's user-added middleware stack."""
+    # Iterate through app.user_middleware, which contains middleware added via app.add_middleware
+    found = False
+    if hasattr(app, 'user_middleware'):
+        # Middleware added via add_middleware are often wrapped in Middleware objects
+        found = any(hasattr(m, 'cls') and m.cls == SlowAPIMiddleware for m in app.user_middleware)
+
+    assert found, "SlowAPIMiddleware not found in app.user_middleware stack."
+
 
 def test_rate_limit_exception_handler_registered():
     """Checks if the RateLimitExceeded handler is registered."""
     assert RateLimitExceeded in app.exception_handlers
+    # Assert the correct handler is registered
+    assert app.exception_handlers[RateLimitExceeded] == _rate_limit_exceeded_handler
