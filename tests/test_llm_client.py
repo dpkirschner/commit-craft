@@ -216,3 +216,37 @@ async def test_generate_commit_message_default_merge_message(mock_openai_client)
     # Assert that the "Existing Message Draft" line is NOT present
     assert "- Existing Message Draft:" not in user_prompt
 
+@pytest.mark.asyncio
+async def test_generate_commit_message_fix_branch_instruction(mock_openai_client):
+    """
+    Tests that a specific instruction is added to the prompt for 'fix/' branches.
+    """
+    # Configure mock response
+    mock_response = MagicMock()
+    mock_message = MagicMock()
+    mock_message.content = "fix: Correct calculation error"
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+    mock_response.choices = [mock_choice]
+    mock_openai_client.return_value = mock_response
+
+    fix_branch_name = "fix/JIRA-456-calculation-bug"
+
+    # Call the function with a 'fix/' branch name
+    await generate_commit_message_with_context(
+        diff_text=SAMPLE_DIFF,
+        branch_name=fix_branch_name, # Use the fix branch name
+        changed_files=SAMPLE_FILES,
+        author_name=SAMPLE_AUTHOR,
+        existing_message=SAMPLE_EXISTING_MSG
+    )
+
+    # Assert call arguments to check the prompt
+    mock_openai_client.assert_awaited_once()
+    call_args, call_kwargs = mock_openai_client.call_args
+    user_prompt = call_kwargs["messages"][1]["content"]
+
+    # Assert that the specific instruction for fix branches is present
+    assert "- Instruction: This appears to be a bug fix branch. Ensure the commit type is 'fix:'." in user_prompt
+    # Assert that the ticket ID parsing still works
+    assert "- Potential Ticket ID from branch: JIRA-456" in user_prompt

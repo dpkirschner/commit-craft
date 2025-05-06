@@ -59,6 +59,9 @@ async def generate_commit_message_with_context(
     prompt_lines.append("\n# Context:")
     prompt_lines.append(f"- Branch: {branch_name}")
 
+    if branch_name.lower().startswith("fix/"):
+        prompt_lines.append("- Instruction: This appears to be a bug fix branch. Ensure the commit type is 'fix:'.")
+
     # Attempt to extract a ticket ID (e.g., JIRA-123, TKT-456)
     # This pattern looks for 1 or more uppercase letters, a hyphen, and 1 or more digits.
     match = re.search(r'([A-Z]+-\d+)', branch_name, re.IGNORECASE)
